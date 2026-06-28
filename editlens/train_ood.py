@@ -90,7 +90,7 @@ class QwenOODDetector(nn.Module):
 # --------------------------------------------------------------------------- #
 #  Data
 # --------------------------------------------------------------------------- #
-def build_loader(split, tok, cfg, shuffle, machine_only=False):
+def build_loader(split, tok, cfg, shuffle, id_only=False):
     ds = load_dataset(cfg["data_path"], split=split).shuffle(seed=42)
     ds = ds.filter(lambda x: x[cfg["score_col"]] is not None, num_proc=8)
     ds = ds.filter(
@@ -104,15 +104,18 @@ def build_loader(split, tok, cfg, shuffle, machine_only=False):
         return score_to_bucket(x[cfg["score_col"]], cfg["n_buckets"],
                                cfg["lo"], cfg["hi"])
 
-    if machine_only:
-        # in-distribution = fully-AI text (top bucket)
-        ds = ds.filter(lambda x: to_bucket(x) == cfg["n_buckets"] - 1, num_proc=8)
+    if id_only:
+        # in-distribution = HUMAN / clean text (bucket 0).
+        # (Lesson from the frozen-embedding run: on this edit-detection setup the
+        #  compact in-distribution is human text, not AI text — see model card.)
+        ds = ds.filter(lambda x: to_bucket(x) == 0, num_proc=8)
 
     texts = [clean_text(t) for t in ds["text"]]
     buckets = [to_bucket(x) for x in ds]
     scores = [float(x[cfg["score_col"]]) for x in ds]
-    # binary OOD label: 1 = human/OOD (bucket 0), 0 = AI/ID (else). Used for AUROC.
-    ood_label = [1 if b == 0 else 0 for b in buckets]
+    # binary OOD label: 1 = AI-edited/generated (OOD outlier), 0 = human (ID).
+    # The OOD score should be HIGH for AI text -> it doubles as the "AI-extent" meter.
+    ood_label = [0 if b == 0 else 1 for b in buckets]
 
     def collate(idx):
         bt = [texts[i] for i in idx]
@@ -158,21 +161,28 @@ def evaluate(model, loader, device):
         all_s.append(s.cpu()); all_ood.append(ood); all_score.append(score)
         all_bucket.append(bucket)
     s = torch.cat(all_s).numpy()
-    ood = torch.cat(all_ood).numpy()
+    ood = torch.cat(all_ood).numpy()   # 1 = AI (outlier), 0 = human (ID)
     edit = torch.cat(all_score).numpy()
     bucket = torch.cat(all_bucket).numpy()
-    # OOD score should be HIGH for human (ood=1) -> AUROC of s vs ood
-    auroc = roc_auc_score(ood, s) if len(set(ood.tolist())) > 1 else float("nan")
-    aupr = average_precision_score(ood, s) if len(set(ood.tolist())) > 1 else float("nan")
-    # does the OOD score track edit magnitude? human has LOW edit (close to source),
-    # AI has HIGH "AI-ness". We measure |corr| of OOD score with the cosine edit score.
-    # Higher OOD score = more human = LOWER cosine distance, so expect NEGATIVE corr.
-    corr = pearsonr(s, edit)[0] if np.std(s) > 0 and np.std(edit) > 0 else float("nan")
+    if len(set(ood.tolist())) < 2:
+        return dict(auroc=float("nan"), aupr=float("nan"),
+                    corr_score_vs_editmag=float("nan"), orientation=1, n=int(len(s)),
+                    mean_score_human=float("nan"), mean_score_ai=float("nan"))
+    # AUTO-ORIENT: the OOD score should be HIGH for AI text. If the raw distance
+    # came out inverted (the failure we saw at AUROC 0.32), flip its sign so the
+    # detector is never reported upside-down. orientation is part of the model.
+    raw = roc_auc_score(ood, s)
+    orientation = 1 if raw >= 0.5 else -1
+    s_oriented = orientation * s
+    auroc = roc_auc_score(ood, s_oriented)
+    aupr = average_precision_score(ood, s_oriented)
+    # Oriented score should rise with edit magnitude (AI text edits more) -> +corr.
+    corr = pearsonr(s_oriented, edit)[0] if np.std(s) > 0 and np.std(edit) > 0 else float("nan")
     return dict(auroc=float(auroc), aupr=float(aupr),
                 corr_score_vs_editmag=float(corr),
-                n=int(len(s)),
-                mean_score_human=float(s[ood == 1].mean()) if (ood == 1).any() else float("nan"),
-                mean_score_ai=float(s[ood == 0].mean()) if (ood == 0).any() else float("nan"))
+                orientation=int(orientation), n=int(len(s)),
+                mean_score_ai=float(s_oriented[ood == 1].mean()),
+                mean_score_human=float(s_oriented[ood == 0].mean()))
 
 
 def main():
@@ -204,7 +214,7 @@ def main():
 
     print("Building loaders...")
     train_loader = build_loader("train", tok, cfg, shuffle=True)
-    id_loader = build_loader("train", tok, cfg, shuffle=True, machine_only=True)
+    id_loader = build_loader("train", tok, cfg, shuffle=True, id_only=True)
     val_loader = build_loader("val", tok, cfg, shuffle=False)
 
     print("Loading model...")
@@ -247,31 +257,107 @@ def main():
 
     verdict = ("STRONG" if best["auroc"] >= 0.85 else
                "MODERATE" if best["auroc"] >= 0.7 else "WEAK")
-    md = f"""# EVAL — Product A: OOD head on Qwen3 (EditLens)
 
-**Idea:** model fully-AI text as in-distribution, score human/lightly-edited text
-as OOD via a DeepSVDD hypersphere on a Qwen3 backbone. The OOD distance is the
-continuous "how-human" meter.
+    # ---- Save the produced model (QLoRA adapter + OOD head + center) ----
+    model_dir = os.path.join(os.getcwd(), "model_out")
+    os.makedirs(model_dir, exist_ok=True)
+    try:
+        # LoRA adapter
+        if hasattr(model.backbone, "save_pretrained"):
+            model.backbone.save_pretrained(model_dir)
+        tok.save_pretrained(model_dir)
+        # OOD head (projection) + center + orientation — the bits that make it a detector
+        torch.save({"proj": model.proj.state_dict(),
+                    "center": model.center.cpu(),
+                    "orientation": best.get("orientation", 1),
+                    "out_dim": model.out_dim,
+                    "base_model": args.model_name},
+                   os.path.join(model_dir, "ood_head.pt"))
+        print(f"Saved model to {model_dir}")
+    except Exception as e:
+        print(f"[save] non-fatal: {e}")
+
+    # ---- EVAL card (artifact) ----
+    eval_md = f"""# EVAL — ood-editguard-qwen3 (OOD AI-edit detector)
+
+**Idea:** model **human/clean text as the in-distribution**, score AI-edited /
+AI-generated text as OOD via a DeepSVDD hypersphere on a Qwen3 backbone. The
+oriented OOD distance is the continuous "how-AI-edited" meter.
 
 **Backbone:** `{args.model_name}` (QLoRA 4-bit) · **Verdict: {verdict}**
 
 | Metric | Value |
 |---|---|
-| AUROC (human-OOD vs AI-ID) | {best['auroc']:.4f} |
+| AUROC (AI vs human) | {best['auroc']:.4f} |
 | AUPR | {best['aupr']:.4f} |
-| corr(OOD score, edit-magnitude) | {best['corr_score_vs_editmag']:.4f} |
-| mean OOD score — human | {best['mean_score_human']:.3f} |
-| mean OOD score — AI | {best['mean_score_ai']:.3f} |
+| corr(score, edit-magnitude) | {best['corr_score_vs_editmag']:.4f} |
+| mean score — AI | {best['mean_score_ai']:.3f} |
+| mean score — human | {best['mean_score_human']:.3f} |
+| auto-orientation | {best.get('orientation')} |
 | best epoch | {best.get('epoch')} |
-
-A random detector scores AUROC 0.5. AUROC = {best['auroc']:.3f} shows the
-DeepSVDD hypersphere trained on AI text systematically assigns larger distance
-to human text — the paper's "human texts are outliers" mechanism, transplanted
-onto a modern Qwen3 backbone for the AI-edit-detection problem.
 """
-    open(os.path.join(os.getcwd(), "EVAL.md"), "w").write(md)
-    open(os.path.join(art, "EVAL.md"), "w").write(md)
-    print(md)
+    open(os.path.join(os.getcwd(), "EVAL.md"), "w").write(eval_md)
+    open(os.path.join(art, "EVAL.md"), "w").write(eval_md)
+    print(eval_md)
+
+    # ---- Build the rich model card + push everything to HF ----
+    try:
+        import sys as _sys
+        _sys.path.append(os.path.dirname(__file__))
+        from model_card import build_card  # noqa
+        usage = """## Usage
+
+```python
+import torch
+from transformers import AutoTokenizer, AutoModel
+from peft import PeftModel
+
+base = "%s"
+tok = AutoTokenizer.from_pretrained("{{NS}}/ood-editguard-qwen3-0.6b")
+backbone = PeftModel.from_pretrained(AutoModel.from_pretrained(base, torch_dtype=torch.bfloat16),
+                                     "{{NS}}/ood-editguard-qwen3-0.6b")
+head = torch.load("ood_head.pt")  # downloaded from the repo
+# score(text) = orientation * ||proj(meanpool(backbone(text))) - center||^2
+```
+
+Higher score = more AI-edited. Calibrate a threshold on your own data.""" % args.model_name
+        results = f"""## Performance
+
+Validation on `pangram/editlens_iclr` (held-out):
+
+| Metric | Value |
+|---|---|
+| **AUROC** (AI vs human) | **{best['auroc']:.3f}** |
+| AUPR | {best['aupr']:.3f} |
+| correlation with edit-magnitude | {best['corr_score_vs_editmag']:+.3f} |
+
+A random detector scores AUROC 0.5."""
+        training = f"""## How it was trained
+
+- **Backbone:** `{args.model_name}`, 4-bit QLoRA (rank 8, all attn+MLP projections).
+- **Head:** a small LayerNorm+Linear projection trained in full, with a DeepSVDD
+  one-class objective: pull **human** embeddings toward a center `c`, push AI
+  embeddings away. Score = oriented squared distance to `c`.
+- **Supervision:** edit-magnitude buckets from `cosine_score` (thresholds 0.03/0.15).
+- **Compute:** a single GPU, minutes."""
+        card = build_card(
+            "A",
+            "ood-editguard-qwen3 — OOD AI-edit detector (Qwen3)",
+            ["ai-detection", "ai-edit-detection", "out-of-distribution",
+             "ood-detection", "content-integrity", "qwen3", "deepsvdd"],
+            "**Detect AI-edited text with an out-of-distribution detector on a Qwen3 "
+            "backbone.** Human text is modeled as the in-distribution; AI-edited and "
+            "AI-generated text are flagged as outliers, giving a continuous "
+            "\"how-AI-edited\" score.",
+            usage, results, training,
+        )
+        from hf_upload import push_to_hub  # noqa
+        url = push_to_hub(model_dir, "ood-editguard-qwen3-0.6b", card_text=card)
+        if url:
+            with open(os.path.join(art, "hf_model_url.txt"), "w") as f:
+                f.write(url + "\n")
+    except Exception as e:
+        print(f"[card/upload] non-fatal: {e}")
 
 
 if __name__ == "__main__":

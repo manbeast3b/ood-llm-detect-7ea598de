@@ -27,7 +27,7 @@ echo "== Installing dependencies =="
 pip install -q --no-input \
     "torch" "transformers>=4.51" "datasets>=2.19" "peft>=0.11" \
     "bitsandbytes>=0.43" "accelerate" "scikit-learn" "scipy" \
-    "sentence-transformers" "emoji" "pandas" 2>&1 | tail -5 || true
+    "sentence-transformers" "emoji" "pandas" "huggingface_hub" 2>&1 | tail -5 || true
 
 echo "== Smoke-test gated dataset access =="
 python - <<'PY'
