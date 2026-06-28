@@ -23,11 +23,12 @@ export HUGGING_FACE_HUB_TOKEN="${HF_TOKEN:-}"
 mkdir -p "$REPO_ROOT/.openresearch/artifacts"
 
 echo "== Installing dependencies =="
-# torch>=2.6 enables the bitsandbytes 4-bit path (set_submodule); QLoRA needs it
-# for the 4B model. bf16+LoRA is the automatic fallback if 4-bit can't attach.
+# Do NOT force-upgrade torch — it breaks the box's pinned torchvision/transformers
+# (torchvision::nms / BloomPreTrainedModel import errors). The 4B runs fine in
+# bf16 + LoRA on an 80GB GPU, the same proven path as the 0.6B run (no 4-bit).
 pip install -q --no-input \
-    "torch>=2.6" "transformers>=4.51" "datasets>=2.19" "peft>=0.11" \
-    "bitsandbytes>=0.43" "accelerate" "scikit-learn" "scipy" \
+    "transformers>=4.51" "datasets>=2.19" "peft>=0.11" \
+    "accelerate" "scikit-learn" "scipy" \
     "sentence-transformers" "emoji" "pandas" "huggingface_hub" 2>&1 | tail -5 || true
 
 echo "== Smoke-test gated dataset access =="
@@ -50,7 +51,6 @@ python editlens/train_ood.py \
     --batch_size "${BATCH:-8}" \
     --epochs "${EPOCHS:-2}" \
     --lr "${LR:-1e-4}" \
-    --qlora \
     --max_train "${MAX_TRAIN:-0}" \
     --max_val "${MAX_VAL:-0}" 2>&1 | tee "$REPO_ROOT/.openresearch/artifacts/train.log"
 
