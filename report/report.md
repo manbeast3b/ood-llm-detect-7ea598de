@@ -12,7 +12,7 @@ The paper's big idea is a **change of perspective**: instead of training a class
 
 We reproduced this end-to-end. A RoBERTa encoder + a **DeepSVDD** anomaly detector, trained on a 3,000-row subsample of the **RAID** dataset for **3 epochs on a single H100 (~4 minutes)**, reached a best **AUROC of 0.941** at separating human from machine text — essentially matching the paper's full-scale RAID DeepSVDD number of **94.7**. A random detector would score 0.5. The core claim — *human texts are outliers, and you can detect them as such* — holds.
 
-![Why "Human Texts Are Outliers"](report/images/fig1_concept.png)
+![Why "Human Texts Are Outliers"](images/fig1_concept.png)
 
 *Left: the **old** way. A binary classifier draws one boundary. It only ever saw a handful of human writing styles, so unfamiliar human styles (hollow circles) fall on the wrong side and get misclassified. Right: the **paper's** way. Wrap a tight ball around machine text; anything far from that ball — in any direction, any style — is called human. There is no boundary to "guess wrong" about unseen human writing.*
 
@@ -47,7 +47,7 @@ This is **out-of-distribution (OOD) detection**. You learn a model of one thing 
 
 The paper offers three OOD detectors (DeepSVDD, HRN, Energy). We reproduced **DeepSVDD** because it is the conceptually cleanest and the one the authors release pretrained weights for. Here is the whole idea in one picture.
 
-![DeepSVDD hypersphere](report/images/fig2_hypersphere.png)
+![DeepSVDD hypersphere](images/fig2_hypersphere.png)
 
 *Every text is turned into a point (a vector) in space by an encoder. DeepSVDD finds a single center point **c** and tries to pull all **machine** points close to it — packing them into a tight ball. **Human** points have no such pull, so they scatter far away. The "score" of a text is simply its **squared distance from c**: small = machine, large = human.*
 
@@ -81,7 +81,7 @@ The DeepSVDD term is what makes "distance from center" meaningful; the contrasti
 
 We deliberately built the **smallest** thing that still demonstrates the mechanism. Here is the full data path of our run.
 
-![End-to-end pipeline](report/images/fig3_pipeline.png)
+![End-to-end pipeline](images/fig3_pipeline.png)
 
 ### Dataset: RAID
 
@@ -122,7 +122,7 @@ Everything else is the paper's repo (`cong-zeng/ood-llm-detect`) unchanged. The 
 
 We log validation metrics on the 750-row test split after every epoch. These are **real measured numbers** straight from the run's training log.
 
-![Training curve](report/images/fig4_training_curve.png)
+![Training curve](images/fig4_training_curve.png)
 
 | Epoch | AUROC | AUPR | Accuracy | FPR@TPR95 |
 | --- | --- | --- | --- | --- |
@@ -138,7 +138,7 @@ After a single epoch the detector is already well above chance (0.797), and by e
 
 If the two classes' scores barely overlap, the detector is good. The figure below shows the intuition (left) and how AUROC is the area under the ROC curve (right). The ROC/AUROC value shown is our **measured 0.941**; the score histograms are illustrative shapes to build intuition.
 
-![Score distributions and ROC](report/images/fig5_scores_roc.png)
+![Score distributions and ROC](images/fig5_scores_roc.png)
 
 *Left: machine texts pile up at **low** scores (inside the ball), human texts at **high** scores (outside). Wherever you put the threshold, most texts land on the correct side. Right: sweeping the threshold from strict to lax traces the ROC curve; the area under it is the AUROC. Our detector encloses 0.941 of that square.*
 
@@ -146,7 +146,7 @@ If the two classes' scores barely overlap, the detector is good. The figure belo
 
 ### How this stacks up against the paper
 
-![Minimal repro vs paper](report/images/fig6_vs_paper.png)
+![Minimal repro vs paper](images/fig6_vs_paper.png)
 
 The minimal run (3,000 rows, 3 epochs) reaches **94.1 AUROC** versus the paper's full-scale RAID DeepSVDD at **94.7** (full dataset, 50 epochs, 2 GPUs). We spent a tiny fraction of the compute and landed within **0.6 points** — strong evidence the mechanism, not scale, is doing the work. The point of a minimal repro is exactly this: show the central effect is real and cheap to demonstrate, then scale only if you want the last fraction of a point.
 
@@ -237,117 +237,3 @@ No change touches the detector's math, the loss, the encoder, or the evaluation 
 ---
 
 *Report generated from run evidence: per-epoch metrics from the run's `train.log`, final metrics from `results.json` (`019f0cc1`), and run/experiment metadata from `orx runs` / `orx experiments`. Figures 1–3 are explanatory diagrams; figure 5's histograms are illustrative; figures 4 and 6 and all quoted metrics are the run's measured numbers.*
-
-
----
-
-<br>
-
-# Original project README
-
-_The original repository README follows below, unchanged._
-
----
-
-# 🧠 Human Texts Are Outliers: Detecting LLM-generated Texts via Out-of-Distribution Detection (NeurIPS 2025)
-
-## 📚 Paper
-
-**Human Texts Are Outliers: Detecting LLM-generated Texts via Out-of-Distribution Detection**  
-*Cong Zeng\*, Shengkun Tang\*, Yuanzhou Chen, Zhiqiang Shen, Wenchao Yu, Xujiang Zhao, Haifeng Chen, Wei Cheng†, Zhiqiang Xu†*  
-*NeurIPS 2025*  
-
-📄 [Paper](https://arxiv.org/abs/2510.08602)
-
----
-
-![Overview](./fig/pipeline.png)
-
----
-
-## 📘 Overview
-
-**This repository implements an Out-of-Distribution (OOD) detection framework**, reframing human text detection as an OOD task. Instead of treating human and machine text as two balanced classes, we **model LLM-generated text as in-distribution (ID)** and **human-written text as out-of-distribution (OOD)**.  
-
-We introduce a suite of OOD-based detectors — **DeepSVDD**, **HRN**, and **Energy-based methods** — that achieve **state-of-the-art (SoTA)** detection performance across multilingual, adversarial, and unseen-model scenarios.
-
-### 🧪 Datasets
-
-| Dataset | Description | Focus |
-|----------|-------------|--------|
-| **DeepFake** | 27 LLMs + multi-domain human text | Cross-domain & model generalization |
-| **M4** | Multi-lingual, multi-domain dataset | Multilingual robustness |
-| **RAID** | Adversarially perturbed LLM text | Attack robustness |
-
-You can download DeepFake and M4 dataset from [Google Drive](https://drive.google.com/drive/folders/17Uyc1PIT7YWi1IGrKVb4IfkB9QYnxSGD?usp=sharing). You can find our pre-processed RAID dataset on [Huggingface](https://huggingface.co/datasets/Shengkun/Raid_split). (You don't need to download yourself, the script will download the dataset automatically).
-
-## ⚙️ Installation
-
-### Using Conda
-
-```bash
-conda create -n ood_llm_detect python=3.10
-conda activate ood_llm_detect
-pip install -r requirements.txt
-```
-
-### Inference Demo
-
-We provide a simple inference demo. You can input a sentence or paragraph and obtain the results directly. Please first download the weights from [google drive](https://drive.google.com/drive/folders/173jObPXmvAS9R0s1PERaSgsbeXlULfHl?usp=sharing).
-
-```bash
-python infer.py --model_path xxxx/model_classifier_best.pth --ood_type deepsvdd --mode deepfake --out_dim 768
-```
-
-## Training
-
-We provide all training scripts in 3 setting including DeepSVDD, HRN and Energy-based methods.
-
-```bash
-# DeepSVDD setting
-bash script/train_dsvdd.sh
-
-# HRN setting
-bash script/train_hrn.sh
-
-# Energy setting
-bash script/train_energy.sh
-```
-
-## Evaluation
-
-After training, you can use the weights to do inference using our scripts:
-
-```bash
-# DeepSVDD setting
-bash script/test_dsvdd.sh
-
-# HRN setting
-bash script/test_hrn.sh
-
-# EnergyKv setting
-bash script/test_energy.sh
-```
-
-We provide our pretrained weights in DeepSVDD setting to reproduce the results in our paper. You can download the weights from [google drive](https://drive.google.com/drive/folders/173jObPXmvAS9R0s1PERaSgsbeXlULfHl?usp=sharing).
-
-
-## Acknowledgement
-
-We gratefully acknowledge that our codebase is largely built upon the [DeTeCtive](https://github.com/heyongxin233/DeTeCtive) library. We thank the authors and contributors for their valuable open-source work and weights, which significantly facilitated our research and development.
-
-## Citation
-
-If you use our code or findings in your research, please cite us as:
-
-```bash
-@misc{zeng2025humantextsoutliersdetecting,
-      title={Human Texts Are Outliers: Detecting LLM-generated Texts via Out-of-distribution Detection}, 
-      author={Cong Zeng and Shengkun Tang and Yuanzhou Chen and Zhiqiang Shen and Wenchao Yu and Xujiang Zhao and Haifeng Chen and Wei Cheng and Zhiqiang Xu},
-      year={2025},
-      eprint={2510.08602},
-      archivePrefix={arXiv},
-      primaryClass={cs.CL},
-      url={https://arxiv.org/abs/2510.08602}, 
-}
-```
