@@ -1,0 +1,56 @@
+model:
+  name: meta-llama/Llama-3.2-3B
+
+data:
+  path: pangram/editlens_iclr
+  score_col: cosine_score
+  n_buckets: 4
+  lo_threshold: 0.03
+  hi_threshold: 0.15
+  max_length: 1024
+  min_words: 75
+  seed: 42
+
+training:
+  output_dir: checkpoints/llama
+  learning_rate: 3e-5
+  per_device_train_batch_size: 3
+  per_device_eval_batch_size: 3
+  gradient_accumulation_steps: 1
+  num_train_epochs: 1
+  weight_decay: 0.0
+  lr_scheduler_type: constant
+  warmup_ratio: 0.0
+  eval_strategy: steps
+  eval_steps: 500
+  save_strategy: steps
+  save_steps: 500
+  logging_steps: 50
+  save_total_limit: 2
+  bf16: true
+  ddp_find_unused_parameters: false
+
+quantization:
+  enabled: true
+  load_in_4bit: true
+  bnb_4bit_quant_type: nf4
+  bnb_4bit_compute_dtype: bfloat16
+
+lora:
+  enabled: true
+  r: 8
+  lora_alpha: 16
+  lora_dropout: 0.05
+  bias: "none"
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+wandb:
+  project: ""
+  name: ""

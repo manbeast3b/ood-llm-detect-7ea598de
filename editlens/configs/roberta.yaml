@@ -1,0 +1,33 @@
+model:
+  name: FacebookAI/roberta-large
+
+data:
+  path: pangram/editlens_iclr
+  score_col: cosine_score
+  n_buckets: 4
+  lo_threshold: 0.03
+  hi_threshold: 0.15
+  max_length: 512
+  min_words: 75
+  seed: 42
+
+training:
+  output_dir: checkpoints/roberta
+  learning_rate: 3e-5
+  per_device_train_batch_size: 24
+  per_device_eval_batch_size: 24
+  num_train_epochs: 1
+  weight_decay: 0.0
+  lr_scheduler_type: constant
+  warmup_ratio: 0.0
+  eval_strategy: steps
+  eval_steps: 500
+  save_strategy: steps
+  save_steps: 500
+  logging_steps: 50
+  save_total_limit: 2
+  bf16: true
+
+wandb:
+  project: ""
+  name: ""
