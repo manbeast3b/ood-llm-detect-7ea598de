@@ -16,7 +16,13 @@ class Indexer(object):
 
     def __init__(self, vector_sz):
         self.index = faiss.IndexFlatIP(vector_sz)
-        self.index = faiss.index_cpu_to_all_gpus(self.index)
+        # Use GPU faiss when available; fall back to CPU (faiss-cpu) otherwise so
+        # the minimal repro runs without the hard-to-pip-install faiss-gpu.
+        if hasattr(faiss, "index_cpu_to_all_gpus"):
+            try:
+                self.index = faiss.index_cpu_to_all_gpus(self.index)
+            except Exception:
+                pass
         self.index_id_to_db_id = []
 
     def index_data(self, ids, embeddings):

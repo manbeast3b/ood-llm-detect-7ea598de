@@ -34,7 +34,7 @@ echo "== Installing dependencies =="
 pip install -q --no-input \
     "transformers==4.41.1" "datasets==2.19.1" "scikit-learn==1.3.2" \
     "pandas==2.0.3" "tqdm" "tiktoken" "nltk" "matplotlib" "pyyaml" \
-    "lightning" "tensorboard" 2>&1 | tail -5 || true
+    "lightning" "tensorboard" "faiss-cpu" 2>&1 | tail -5 || true
 
 # Minimal training config (override-able via env).
 SUBSAMPLE="${SUBSAMPLE:-3000}"     # raid train rows kept
