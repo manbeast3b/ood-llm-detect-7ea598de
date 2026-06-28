@@ -52,11 +52,19 @@ class QwenOODDetector(nn.Module):
                 bnb_4bit_quant_type="nf4",
                 bnb_4bit_compute_dtype=torch.bfloat16,
             )
-        self.backbone = AutoModel.from_pretrained(
-            model_name, quantization_config=quant, torch_dtype=torch.bfloat16
-        )
-        if use_qlora:
-            self.backbone = prepare_model_for_kbit_training(self.backbone)
+        try:
+            self.backbone = AutoModel.from_pretrained(
+                model_name, quantization_config=quant, torch_dtype=torch.bfloat16
+            )
+            if use_qlora:
+                self.backbone = prepare_model_for_kbit_training(self.backbone)
+        except Exception as e:
+            # 4-bit load can fail on old torch (set_submodule) — fall back to bf16.
+            print(f"[model] 4-bit load failed ({e}); retrying in bf16 (no quant).")
+            use_qlora = False
+            self.backbone = AutoModel.from_pretrained(
+                model_name, torch_dtype=torch.bfloat16
+            )
 
         # LoRA on top (works in bf16 or on the 4-bit base). Falls back to a frozen
         # backbone if PEFT can't attach, so the run always proceeds.
@@ -111,8 +119,9 @@ def build_loader(split, tok, cfg, shuffle, id_only=False):
         lambda x: x["text"] is not None and count_words(x["text"]) >= cfg["min_words"],
         num_proc=8,
     )
-    if cfg.get(f"max_{split}") is not None:
-        ds = ds.select(range(min(cfg[f"max_{split}"], len(ds))))
+    _cap = cfg.get(f"max_{split}")
+    if _cap is not None and _cap > 0:
+        ds = ds.select(range(min(_cap, len(ds))))
 
     def to_bucket(x):
         return score_to_bucket(x[cfg["score_col"]], cfg["n_buckets"],
@@ -213,6 +222,7 @@ def main():
     # QLoRA (4-bit) is OFF by default — it needs a recent torch (set_submodule);
     # bf16 + LoRA is the robust default and is plenty for the 0.6B/1.7B backbones.
     ap.add_argument("--qlora", action="store_true", help="use 4-bit QLoRA (needs torch>=2.6)")
+    ap.add_argument("--repo_suffix", default="ood-editguard-qwen3-0.6b", help="HF repo name to publish to")
     args = ap.parse_args()
 
     art = os.path.join(os.getcwd(), ".openresearch", "artifacts")
@@ -321,22 +331,24 @@ oriented OOD distance is the continuous "how-AI-edited" meter.
         import sys as _sys
         _sys.path.append(os.path.dirname(__file__))
         from model_card import build_card  # noqa
-        usage = """## Usage
+        usage = ("""## Usage
 
 ```python
 import torch
 from transformers import AutoTokenizer, AutoModel
 from peft import PeftModel
 
-base = "%s"
-tok = AutoTokenizer.from_pretrained("{{NS}}/ood-editguard-qwen3-0.6b")
+base = "__BASE__"
+tok = AutoTokenizer.from_pretrained("{{NS}}/__SUFFIX__")
 backbone = PeftModel.from_pretrained(AutoModel.from_pretrained(base, torch_dtype=torch.bfloat16),
-                                     "{{NS}}/ood-editguard-qwen3-0.6b")
+                                     "{{NS}}/__SUFFIX__")
 head = torch.load("ood_head.pt")  # downloaded from the repo
 # score(text) = orientation * ||proj(meanpool(backbone(text))) - center||^2
 ```
 
-Higher score = more AI-edited. Calibrate a threshold on your own data.""" % args.model_name
+Higher score = more AI-edited. Calibrate a threshold on your own data."""
+                 .replace("__BASE__", args.model_name)
+                 .replace("__SUFFIX__", args.repo_suffix))
         results = f"""## Performance
 
 Validation on `pangram/editlens_iclr` (held-out):
@@ -368,7 +380,7 @@ A random detector scores AUROC 0.5."""
             usage, results, training,
         )
         from hf_upload import push_to_hub  # noqa
-        url = push_to_hub(model_dir, "ood-editguard-qwen3-0.6b", card_text=card)
+        url = push_to_hub(model_dir, args.repo_suffix, card_text=card)
         if url:
             with open(os.path.join(art, "hf_model_url.txt"), "w") as f:
                 f.write(url + "\n")
