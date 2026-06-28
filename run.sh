@@ -24,7 +24,7 @@ mkdir -p "$REPO_ROOT/.openresearch/artifacts"
 echo "== Installing dependencies =="
 pip install -q --no-input \
     "torch" "transformers>=4.51" "datasets>=2.19" "accelerate" \
-    "scikit-learn" "scipy" "emoji" "pandas" 2>&1 | tail -5 || true
+    "scikit-learn" "scipy" "emoji" "pandas" "huggingface_hub" 2>&1 | tail -5 || true
 
 echo "== Smoke-test gated dataset access =="
 python - <<'PY'

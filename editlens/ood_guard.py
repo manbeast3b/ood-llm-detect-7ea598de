@@ -141,12 +141,18 @@ def main():
                selective_curve=sel_curve,
                n_val=int(len(va_texts)), model=args.model_name)
     json.dump(res, open(os.path.join(art, "results.json"), "w"), indent=2)
+
+    # ---- save the guard (the shippable product) ----
+    model_dir = os.path.join(os.getcwd(), "model_out")
+    os.makedirs(model_dir, exist_ok=True)
+    np.savez(os.path.join(model_dir, "ood_guard.npz"), center=c, inv_cov=inv,
+             base_model=args.model_name)
     np.savez(os.path.join(art, "ood_guard.npz"), center=c, inv_cov=inv)
 
     verdict = ("STRONG" if res["accuracy_lift"] >= 0.03 else
                "MODERATE" if res["accuracy_lift"] >= 0.01 else "WEAK")
     rows = "\n".join(f"| {p['coverage']:.0%} | {p['accuracy']:.4f} |" for p in sel_curve)
-    md = f"""# EVAL — Product C: OOD guard alongside EditLens
+    eval_md = f"""# EVAL — editlens-ood-selective-guard-qwen3
 
 **Idea:** keep EditLens's edit-score, add a DeepSVDD OOD guard as a confidence
 gate. Abstain on the most out-of-distribution inputs (domain shift, unseen
@@ -154,8 +160,6 @@ models, non-native English) so the score isn't trusted blindly — selective
 prediction.
 
 **Frozen backbone:** `{args.model_name}` · **Verdict: {verdict}**
-
-**Selective prediction (abstain on highest OOD score):**
 
 | Coverage | EditLens 3-way accuracy |
 |---|---|
@@ -166,15 +170,73 @@ prediction.
 | accuracy @ 100% coverage (base) | {base_acc:.4f} |
 | accuracy @ 80% coverage | {acc_at_80:.4f} |
 | **lift from abstaining on 20% most-OOD** | **{res['accuracy_lift']:+.4f}** |
-| guard AUROC (flags human-ish/OOD) | {guard_auroc:.4f} |
-
-If accuracy rises as we abstain on the most-OOD inputs, the guard is correctly
-identifying the inputs EditLens is least reliable on — the product is an
-"edit-score + reliability flag" with fewer confident mistakes.
+| guard AUROC | {guard_auroc:.4f} |
 """
-    open(os.path.join(os.getcwd(), "EVAL.md"), "w").write(md)
-    open(os.path.join(art, "EVAL.md"), "w").write(md)
-    print(md)
+    open(os.path.join(os.getcwd(), "EVAL.md"), "w").write(eval_md)
+    open(os.path.join(art, "EVAL.md"), "w").write(eval_md)
+    print(eval_md)
+
+    # ---- rich model card + push to HF ----
+    try:
+        import sys as _sys
+        _sys.path.append(os.path.dirname(__file__))
+        from model_card import build_card
+        usage = f"""## Usage
+
+A **reliability guard**: download `ood_guard.npz`, score each input's distance to
+the training distribution, and **abstain** when it's too far (route to a human, or
+withhold a verdict).
+
+```python
+import numpy as np, torch
+from transformers import AutoTokenizer, AutoModel
+g = np.load("ood_guard.npz"); center, inv = g["center"], g["inv_cov"]
+tok = AutoTokenizer.from_pretrained("{args.model_name}")
+enc = AutoModel.from_pretrained("{args.model_name}", torch_dtype=torch.bfloat16).eval()
+def ood_distance(text):
+    t = tok(text.lower(), truncation=True, max_length=512, return_tensors="pt")
+    h = enc(**t).last_hidden_state.mean(1)[0].float().numpy()
+    d = h - center
+    return float(d @ inv @ d)   # high = out-of-distribution -> abstain
+```
+
+Set the abstain threshold from the coverage/accuracy table below."""
+        results = f"""## Performance — selective prediction
+
+Abstaining on the most out-of-distribution inputs raises accuracy on the rest:
+
+| Coverage (kept) | accuracy |
+|---|---|
+{rows}
+
+| Summary | Value |
+|---|---|
+| base accuracy (100% coverage) | {base_acc:.3f} |
+| accuracy @ 80% coverage | {acc_at_80:.3f} |
+| **lift from abstaining on the 20% most-OOD** | **{res['accuracy_lift']:+.3f}** |"""
+        training = f"""## How it was made
+
+- **Frozen backbone:** `{args.model_name}` (no fine-tuning).
+- **Guard:** a DeepSVDD detector (center + whitening) fit on the **training
+  distribution**; inputs far from it are flagged out-of-distribution and abstained.
+- **Cost:** one embedding pass + a closed-form fit."""
+        card = build_card(
+            "C",
+            "editlens-ood-selective-guard-qwen3 — reliability guard for EditLens",
+            ["ai-detection", "ai-edit-detection", "out-of-distribution",
+             "ood-detection", "selective-prediction", "content-integrity", "qwen3"],
+            "**A reliability guard for AI-edit detection.** An out-of-distribution "
+            "gate that abstains on inputs unlike the training distribution (domain "
+            "shift, unseen models, non-native English), so the edit-score is only "
+            "trusted where it's reliable.",
+            usage, results, training,
+        )
+        from hf_upload import push_to_hub
+        url = push_to_hub(model_dir, "editlens-ood-selective-guard-qwen3", card_text=card)
+        if url:
+            open(os.path.join(art, "hf_model_url.txt"), "w").write(url + "\n")
+    except Exception as e:
+        print(f"[card/upload] non-fatal: {e}")
 
 
 if __name__ == "__main__":
