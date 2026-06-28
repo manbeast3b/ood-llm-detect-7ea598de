@@ -18,6 +18,7 @@ if ! command -v python >/dev/null 2>&1; then PY="$(command -v python3)"; python(
 
 export HF_HOME="${HF_HOME:-$REPO_ROOT/.hf_cache}"
 export TOKENIZERS_PARALLELISM=false
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export HF_TOKEN="${HF_TOKEN:-${HUGGINGFACE_TOKEN:-}}"
 export HUGGING_FACE_HUB_TOKEN="${HF_TOKEN:-}"
 mkdir -p "$REPO_ROOT/.openresearch/artifacts"
@@ -47,8 +48,10 @@ python editlens/train_ood.py \
     --model_name "$MODEL" \
     --repo_suffix "${REPO_SUFFIX:-ood-editguard-qwen3-4b}" \
     --out_dim "${OUT_DIM:-256}" \
-    --max_length "${MAXLEN:-1024}" \
-    --batch_size "${BATCH:-8}" \
+    --max_length "${MAXLEN:-768}" \
+    --batch_size "${BATCH:-2}" \
+    --grad_accum "${GRAD_ACCUM:-8}" \
+    --grad_ckpt \
     --epochs "${EPOCHS:-2}" \
     --lr "${LR:-1e-4}" \
     --max_train "${MAX_TRAIN:-0}" \

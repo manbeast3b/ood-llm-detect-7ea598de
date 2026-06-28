@@ -42,7 +42,8 @@ from scipy.stats import pearsonr  # noqa: E402
 #  Model: Qwen3 (4-bit) encoder  +  DeepSVDD projection head
 # --------------------------------------------------------------------------- #
 class QwenOODDetector(nn.Module):
-    def __init__(self, model_name, out_dim=256, use_qlora=False, use_lora=True, lora_r=8):
+    def __init__(self, model_name, out_dim=256, use_qlora=False, use_lora=True,
+                 lora_r=8, grad_ckpt=False):
         super().__init__()
         quant = None
         if use_qlora:
@@ -86,6 +87,18 @@ class QwenOODDetector(nn.Module):
         else:
             for p in self.backbone.parameters():
                 p.requires_grad = False
+        # Gradient checkpointing — large memory saving for the 4B backbone.
+        if grad_ckpt:
+            try:
+                base = getattr(self.backbone, "base_model", self.backbone)
+                base = getattr(base, "model", base)
+                base.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False})
+                if hasattr(self.backbone, "enable_input_require_grads"):
+                    self.backbone.enable_input_require_grads()
+                print("[model] gradient checkpointing enabled")
+            except Exception as e:
+                print(f"[model] grad ckpt enable failed (non-fatal): {e}")
         hidden = self.backbone.config.hidden_size
         # projection head trained in full (float32 for stability)
         self.proj = nn.Sequential(
@@ -223,6 +236,8 @@ def main():
     # bf16 + LoRA is the robust default and is plenty for the 0.6B/1.7B backbones.
     ap.add_argument("--qlora", action="store_true", help="use 4-bit QLoRA (needs torch>=2.6)")
     ap.add_argument("--repo_suffix", default="ood-editguard-qwen3-0.6b", help="HF repo name to publish to")
+    ap.add_argument("--grad_ckpt", action="store_true", help="gradient checkpointing (saves memory)")
+    ap.add_argument("--grad_accum", type=int, default=1, help="gradient accumulation steps")
     args = ap.parse_args()
 
     art = os.path.join(os.getcwd(), ".openresearch", "artifacts")
@@ -245,7 +260,8 @@ def main():
 
     print("Loading model...")
     model = QwenOODDetector(args.model_name, out_dim=args.out_dim,
-                            use_qlora=args.qlora, use_lora=True).to(device)
+                            use_qlora=args.qlora, use_lora=True,
+                            grad_ckpt=args.grad_ckpt).to(device)
 
     init_center(model, id_loader, device)
 
@@ -254,9 +270,11 @@ def main():
 
     best = {"auroc": -1}
     history = []
+    accum = max(1, args.grad_accum)
     for epoch in range(args.epochs):
         model.train()
         running = 0.0
+        opt.zero_grad()
         for i, (ids, am, bucket, score, ood) in enumerate(train_loader):
             ids, am, ood = ids.to(device), am.to(device), ood.to(device)
             z, s = model(ids, am)
@@ -266,9 +284,11 @@ def main():
             loss_id = s[id_mask].mean() if id_mask.any() else s.new_tensor(0.0)
             loss_ood = F.relu(4.0 - s[ood_mask]).mean() if ood_mask.any() else s.new_tensor(0.0)
             loss = loss_id + loss_ood
-            opt.zero_grad(); loss.backward(); opt.step()
+            (loss / accum).backward()
+            if (i + 1) % accum == 0:
+                opt.step(); opt.zero_grad()
             running = (running * i + loss.item()) / (i + 1)
-            if i % 20 == 0:
+            if i % 50 == 0:
                 print(f"epoch {epoch} step {i} loss {loss.item():.4f} avg {running:.4f}", flush=True)
         metrics = evaluate(model, val_loader, device)
         metrics["epoch"] = epoch
