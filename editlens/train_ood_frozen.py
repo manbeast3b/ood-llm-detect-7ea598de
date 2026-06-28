@@ -1,0 +1,158 @@
+"""
+Product B — OOD on FROZEN EditLens embeddings.
+
+Take the already-trained reneeice/editlens-qwen3 model as a *frozen* feature
+extractor, pull its last-hidden-state embeddings, and fit a tiny DeepSVDD
+detector on top (center + whitening, no backbone training). This tests whether
+the OOD framing (arXiv 2510.08602) recovers a strong human/AI separation from
+EditLens features at a fraction of the cost — and yields a few-KB "OOD adapter"
+that snaps onto a frozen checkpoint.
+
+No gradient training of the backbone: we just (1) embed, (2) compute the ID
+center over AI text, (3) score by Mahalanobis-style distance. Fast, mostly a
+single forward pass over the data.
+
+Writes EVAL.md + results.json to .openresearch/artifacts/.
+"""
+import os
+import sys
+import json
+import argparse
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+sys.path.append(os.path.join(os.path.dirname(__file__), "scripts"))
+from preprocess import clean_text, count_words, score_to_bucket  # noqa: E402
+
+from datasets import load_dataset  # noqa: E402
+from transformers import AutoTokenizer, AutoModel  # noqa: E402
+from sklearn.metrics import roc_auc_score, average_precision_score  # noqa: E402
+from scipy.stats import pearsonr  # noqa: E402
+
+
+@torch.no_grad()
+def embed_split(split, tok, model, device, cfg, max_n):
+    ds = load_dataset(cfg["data_path"], split=split).shuffle(seed=42)
+    ds = ds.filter(lambda x: x[cfg["score_col"]] is not None, num_proc=8)
+    ds = ds.filter(
+        lambda x: x["text"] is not None and count_words(x["text"]) >= cfg["min_words"],
+        num_proc=8,
+    )
+    if max_n is not None:
+        ds = ds.select(range(min(max_n, len(ds))))
+
+    texts = [clean_text(t) for t in ds["text"]]
+    buckets = [score_to_bucket(x[cfg["score_col"]], cfg["n_buckets"], cfg["lo"], cfg["hi"])
+               for x in ds]
+    edit = np.array([float(x[cfg["score_col"]]) for x in ds], dtype=np.float32)
+    ood_label = np.array([1 if b == 0 else 0 for b in buckets])  # human/OOD = 1
+
+    embs = []
+    bs = cfg["batch_size"]
+    for i in range(0, len(texts), bs):
+        chunk = texts[i:i + bs]
+        enc = tok(chunk, truncation=True, max_length=cfg["max_length"],
+                  padding=True, return_tensors="pt").to(device)
+        out = model(**enc)
+        h = out.last_hidden_state
+        mask = enc["attention_mask"].unsqueeze(-1).to(h.dtype)
+        pooled = (h * mask).sum(1) / mask.sum(1).clamp(min=1)
+        embs.append(F.normalize(pooled.float(), dim=-1).cpu())
+        if (i // bs) % 20 == 0:
+            print(f"  embedded {i+len(chunk)}/{len(texts)} [{split}]", flush=True)
+    return torch.cat(embs).numpy(), ood_label, edit, np.array(buckets)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model_name", default="reneeice/editlens-qwen3-0.6b-repro")
+    ap.add_argument("--data_path", default="pangram/editlens_iclr")
+    ap.add_argument("--max_length", type=int, default=512)
+    ap.add_argument("--batch_size", type=int, default=16)
+    ap.add_argument("--max_train", type=int, default=4000)
+    ap.add_argument("--max_val", type=int, default=1500)
+    args = ap.parse_args()
+
+    art = os.path.join(os.getcwd(), ".openresearch", "artifacts")
+    os.makedirs(art, exist_ok=True)
+    cfg = dict(data_path=args.data_path, score_col="cosine_score", n_buckets=4,
+               lo=0.03, hi=0.15, max_length=args.max_length, min_words=75,
+               batch_size=args.batch_size)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    tok = AutoTokenizer.from_pretrained(args.model_name)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    # frozen feature extractor — load the SequenceClassification model's base encoder
+    model = AutoModel.from_pretrained(args.model_name, torch_dtype=torch.bfloat16).to(device)
+    model.eval()
+
+    print("Embedding train split...")
+    Xtr, ood_tr, edit_tr, bk_tr = embed_split("train", tok, model, device, cfg, args.max_train)
+    print("Embedding val split...")
+    Xva, ood_va, edit_va, bk_va = embed_split("val", tok, model, device, cfg, args.max_val)
+
+    # --- DeepSVDD-style detector on frozen features ---
+    # ID = AI text (ood==0). Center = mean of ID embeddings; whiten by ID covariance.
+    id_idx = (ood_tr == 0)
+    c = Xtr[id_idx].mean(0)
+    Xc = Xtr[id_idx] - c
+    cov = np.cov(Xc.T) + 1e-3 * np.eye(Xc.shape[1])
+    inv = np.linalg.inv(cov)
+
+    def score(X):
+        d = X - c
+        # Mahalanobis distance to the AI in-distribution
+        return np.einsum("ij,jk,ik->i", d, inv, d)
+
+    s_va = score(Xva)
+    auroc = roc_auc_score(ood_va, s_va) if len(set(ood_va.tolist())) > 1 else float("nan")
+    aupr = average_precision_score(ood_va, s_va) if len(set(ood_va.tolist())) > 1 else float("nan")
+    corr = pearsonr(s_va, edit_va)[0] if np.std(s_va) > 0 else float("nan")
+
+    # also a simpler cosine-to-center variant for reference
+    s_cos = ((Xva - c) ** 2).sum(1)
+    auroc_cos = roc_auc_score(ood_va, s_cos) if len(set(ood_va.tolist())) > 1 else float("nan")
+
+    res = dict(auroc=float(auroc), auroc_euclid=float(auroc_cos), aupr=float(aupr),
+               corr_score_vs_editmag=float(corr), n_val=int(len(s_va)),
+               n_id_train=int(id_idx.sum()),
+               mean_score_human=float(s_va[ood_va == 1].mean()),
+               mean_score_ai=float(s_va[ood_va == 0].mean()),
+               model=args.model_name)
+    json.dump(res, open(os.path.join(art, "results.json"), "w"), indent=2)
+
+    # save the tiny adapter (center + inverse cov) — the shippable product
+    np.savez(os.path.join(art, "ood_adapter.npz"), center=c, inv_cov=inv)
+
+    verdict = ("STRONG" if auroc >= 0.85 else "MODERATE" if auroc >= 0.7 else "WEAK")
+    md = f"""# EVAL — Product B: OOD on frozen EditLens embeddings
+
+**Idea:** freeze the EditLens/Qwen3 model, fit a tiny DeepSVDD detector
+(center + whitening) on its embeddings. No backbone training — a few-KB OOD
+adapter that snaps onto a frozen checkpoint.
+
+**Frozen backbone:** `{args.model_name}` · **Verdict: {verdict}**
+
+| Metric | Value |
+|---|---|
+| AUROC (Mahalanobis) | {auroc:.4f} |
+| AUROC (Euclidean) | {auroc_cos:.4f} |
+| AUPR | {aupr:.4f} |
+| corr(OOD score, edit-magnitude) | {corr:.4f} |
+| mean score — human | {res['mean_score_human']:.3f} |
+| mean score — AI | {res['mean_score_ai']:.3f} |
+| ID (AI) train embeddings | {res['n_id_train']} |
+
+The adapter (`ood_adapter.npz`, center + inverse covariance) is the product:
+attach it to any frozen EditLens checkpoint for an anomaly / human-likeness score
+with zero backbone fine-tuning.
+"""
+    open(os.path.join(os.getcwd(), "EVAL.md"), "w").write(md)
+    open(os.path.join(art, "EVAL.md"), "w").write(md)
+    print(md)
+
+
+if __name__ == "__main__":
+    main()
