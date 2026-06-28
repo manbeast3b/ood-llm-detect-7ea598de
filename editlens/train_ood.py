@@ -42,10 +42,11 @@ from scipy.stats import pearsonr  # noqa: E402
 #  Model: Qwen3 (4-bit) encoder  +  DeepSVDD projection head
 # --------------------------------------------------------------------------- #
 class QwenOODDetector(nn.Module):
-    def __init__(self, model_name, out_dim=256, use_qlora=True, lora_r=8):
+    def __init__(self, model_name, out_dim=256, use_qlora=False, use_lora=True, lora_r=8):
         super().__init__()
         quant = None
         if use_qlora:
+            # 4-bit path: only when bitsandbytes + a recent torch are present.
             quant = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_quant_type="nf4",
@@ -56,14 +57,27 @@ class QwenOODDetector(nn.Module):
         )
         if use_qlora:
             self.backbone = prepare_model_for_kbit_training(self.backbone)
-            lcfg = LoraConfig(
-                r=lora_r, lora_alpha=2 * lora_r, lora_dropout=0.05, bias="none",
-                target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                                "gate_proj", "up_proj", "down_proj"],
-                task_type="FEATURE_EXTRACTION",
-            )
-            self.backbone = get_peft_model(self.backbone, lcfg)
-            self.backbone.print_trainable_parameters()
+
+        # LoRA on top (works in bf16 or on the 4-bit base). Falls back to a frozen
+        # backbone if PEFT can't attach, so the run always proceeds.
+        if use_lora:
+            try:
+                lcfg = LoraConfig(
+                    r=lora_r, lora_alpha=2 * lora_r, lora_dropout=0.05, bias="none",
+                    target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                                    "gate_proj", "up_proj", "down_proj"],
+                    task_type="FEATURE_EXTRACTION",
+                )
+                self.backbone = get_peft_model(self.backbone, lcfg)
+                self.backbone.print_trainable_parameters()
+            except Exception as e:
+                print(f"[model] LoRA attach failed ({e}); freezing backbone, "
+                      f"training the OOD head only.")
+                for p in self.backbone.parameters():
+                    p.requires_grad = False
+        else:
+            for p in self.backbone.parameters():
+                p.requires_grad = False
         hidden = self.backbone.config.hidden_size
         # projection head trained in full (float32 for stability)
         self.proj = nn.Sequential(
@@ -196,7 +210,9 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--max_train", type=int, default=4000)
     ap.add_argument("--max_val", type=int, default=1500)
-    ap.add_argument("--no_qlora", action="store_true")
+    # QLoRA (4-bit) is OFF by default — it needs a recent torch (set_submodule);
+    # bf16 + LoRA is the robust default and is plenty for the 0.6B/1.7B backbones.
+    ap.add_argument("--qlora", action="store_true", help="use 4-bit QLoRA (needs torch>=2.6)")
     args = ap.parse_args()
 
     art = os.path.join(os.getcwd(), ".openresearch", "artifacts")
@@ -219,7 +235,7 @@ def main():
 
     print("Loading model...")
     model = QwenOODDetector(args.model_name, out_dim=args.out_dim,
-                            use_qlora=not args.no_qlora).to(device)
+                            use_qlora=args.qlora, use_lora=True).to(device)
 
     init_center(model, id_loader, device)
 
@@ -284,7 +300,7 @@ def main():
 AI-generated text as OOD via a DeepSVDD hypersphere on a Qwen3 backbone. The
 oriented OOD distance is the continuous "how-AI-edited" meter.
 
-**Backbone:** `{args.model_name}` (QLoRA 4-bit) · **Verdict: {verdict}**
+**Backbone:** `{args.model_name}` ({"4-bit QLoRA" if args.qlora else "bf16 + LoRA"}) · **Verdict: {verdict}**
 
 | Metric | Value |
 |---|---|
@@ -334,7 +350,7 @@ Validation on `pangram/editlens_iclr` (held-out):
 A random detector scores AUROC 0.5."""
         training = f"""## How it was trained
 
-- **Backbone:** `{args.model_name}`, 4-bit QLoRA (rank 8, all attn+MLP projections).
+- **Backbone:** `{args.model_name}`, {"4-bit QLoRA" if args.qlora else "bf16 + LoRA"} (rank 8, all attn+MLP projections).
 - **Head:** a small LayerNorm+Linear projection trained in full, with a DeepSVDD
   one-class objective: pull **human** embeddings toward a center `c`, push AI
   embeddings away. Score = oriented squared distance to `c`.
