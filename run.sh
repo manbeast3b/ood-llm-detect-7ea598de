@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 ###############################################################################
-# SCALED Product A — OOD AI-edit detector on the 4B EditLens-Qwen3 backbone.
+# FULL-DATASET Product A — OOD AI-edit detector on the 0.6B EditLens-Qwen3 backbone.
 #
-# Scales the winning OOD-head detector (Product A, AUROC 0.941 at 0.6B) to the
-# 4B EditLens-Qwen3 repro backbone on the FULL pangram/editlens_iclr training
-# set. Fine-tunes the DeepSVDD OOD head (human = in-distribution) with QLoRA;
-# the score is the oriented distance from the human center — a continuous
-# "how-AI-edited" meter. Publishes to HF as ood-editguard-qwen3-4b.
+# Trains the winning OOD-head detector (Product A) on the 0.6B EditLens-Qwen3
+# repro backbone over the FULL pangram/editlens_iclr training set (vs the earlier
+# 4,000-sample proof). 0.6B already hit AUROC 0.941 on a subsample; the full set
+# gives the production model far faster than 4B (see the scaling/requirements
+# report). Fine-tunes the DeepSVDD OOD head (human = in-distribution); the score
+# is the oriented distance from the human center — a continuous "how-AI-edited"
+# meter. Publishes to HF as ood-editguard-qwen3-0.6b-full.
 #
 # Requires HF_TOKEN with access to the gated pangram/editlens_iclr dataset.
 ###############################################################################
@@ -40,18 +42,21 @@ ds = load_dataset("pangram/editlens_iclr", split="val", token=os.environ.get("HF
 print("OK: editlens_iclr val rows =", len(ds))
 PY
 
-# Base = the 4B EditLens-Qwen3 repro (search HF: "editlens qwen3 repro").
+# Base = the 0.6B EditLens-Qwen3 repro (search HF: "editlens qwen3 repro").
 # Its encoder already understands edit-extent; we fine-tune the OOD head onto it.
-MODEL="${MODEL:-${BASE_MODEL:-reneeice/editlens-qwen3-4b-repro}}"
+# 0.6B is tiny: bigger batch, no gradient checkpointing → much faster, full model.
+MODEL="${MODEL:-${BASE_MODEL:-reneeice/editlens-qwen3-0.6b-repro}}"
+# Gradient checkpointing only when explicitly requested (not needed at 0.6B).
+GCK_FLAG=""; [ "${GRAD_CKPT:-0}" = "1" ] && GCK_FLAG="--grad_ckpt"
 echo "== Scaling OOD head on $MODEL (full dataset) =="
 python editlens/train_ood.py \
     --model_name "$MODEL" \
-    --repo_suffix "${REPO_SUFFIX:-ood-editguard-qwen3-4b}" \
+    --repo_suffix "${REPO_SUFFIX:-ood-editguard-qwen3-0.6b-full}" \
     --out_dim "${OUT_DIM:-256}" \
     --max_length "${MAXLEN:-768}" \
-    --batch_size "${BATCH:-2}" \
-    --grad_accum "${GRAD_ACCUM:-8}" \
-    --grad_ckpt \
+    --batch_size "${BATCH:-16}" \
+    --grad_accum "${GRAD_ACCUM:-1}" \
+    $GCK_FLAG \
     --epochs "${EPOCHS:-2}" \
     --lr "${LR:-1e-4}" \
     --max_train "${MAX_TRAIN:-0}" \
