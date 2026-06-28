@@ -11,11 +11,19 @@ raid_name_dct = {'GPT': ["gpt3", "gpt2"],
 raid_model_set ={'GPT':0, 'ChatGPT':1, 'Meta-LLaMA':2,'MPT':3,'Cohere':4,\
             'Mistral':5,'human':6}
 
-def load_raid(machine_text_only=False):
+def load_raid(machine_text_only=False, subsample=0):
     data_new = {"train": [], "test": []}
     raid_train = load_dataset("Shengkun/Raid_split", split="train")
     raid_test = load_dataset("Shengkun/Raid_split", split="test")
-    
+
+    # Optional subsampling for a fast, minimal end-to-end run. We shuffle with a
+    # fixed seed and keep `subsample` train rows (and a proportional test set) so
+    # both human (OOD) and machine (ID) examples remain represented.
+    if subsample and subsample > 0:
+        raid_train = raid_train.shuffle(seed=42).select(range(min(subsample, len(raid_train))))
+        test_n = max(200, subsample // 4)
+        raid_test = raid_test.shuffle(seed=42).select(range(min(test_n, len(raid_test))))
+
     if machine_text_only:
         raid_train = raid_train.filter(lambda sample: sample["model"] != "human")
     

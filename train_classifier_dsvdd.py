@@ -84,11 +84,11 @@ def train(opt):
         
         val_dataset = PassagesDataset(dataset[opt.test_dataset_name],mode='M4')
     elif opt.dataset=='raid':
-        dataset = load_raid()
+        dataset = load_raid(subsample=opt.subsample)
         passages_dataset = PassagesDataset(dataset[opt.database_name],mode='raid')
         val_dataset = PassagesDataset(dataset[opt.test_dataset_name],mode='raid')
 
-        machine_dataset = load_raid(machine_text_only=True)
+        machine_dataset = load_raid(machine_text_only=True, subsample=opt.subsample)
         machine_passages_dataset = PassagesDataset(machine_dataset[opt.database_name],mode='raid')
 
 
@@ -342,6 +342,7 @@ if __name__ == "__main__":
     parser.add_argument('--database_name', type=str, default='train', help="train,valid,test,test_ood")
     parser.add_argument('--test_dataset_name', type=str, default='test', help="train,valid,test,test_ood")
     parser.add_argument('--topk', type=int, default=10, help="Search topk nearest neighbors for validation")
+    parser.add_argument('--subsample', type=int, default=0, help="If >0, subsample this many raid train rows for a fast minimal run")
 
     parser.add_argument('--a', type=float, default=1)
     parser.add_argument('--b', type=float, default=1) 
